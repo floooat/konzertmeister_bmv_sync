@@ -1,5 +1,8 @@
 import OpenAI from "openai";
 import dotenv from "dotenv";
+import { z } from "zod";
+import { zodResponseFormat } from "openai/helpers/zod";
+import { Proben } from "./bmvSync";
 
 // Load environment variables from .env file
 dotenv.config();
@@ -26,66 +29,95 @@ export const EVENT_CATEGORIES = [
   "Vereinseigene Musikfeste",
 ];
 
+// Define the schema for the classification response
+const ClassificationResponse = z.object({
+  category: z.string(),
+  confidence: z.number(),
+  reasoning: z.string().optional(),
+});
+
 /**
  * Classifier function that picks the best match from a set of possible categories
- * using the OpenAI ChatCompletion endpoint, returning JSON.
+ * using the OpenAI ChatCompletion endpoint with structured output.
  */
 export async function identifyP_V_ArtFromOpenAI(
   text: string,
-  categories: string[]
+  categories: string[],
+  learningContext: Proben[]
 ): Promise<string> {
   try {
     const openai = new OpenAI({
       apiKey: process.env.OPENAI_API_KEY,
     });
 
-    console.log("text", text);
-    // Construct a system prompt that forces a JSON-only output
-    const systemPrompt = `
-You are a classification assistant. You are given some text describing a musical event or rehearsal:
-"${text}"
+    const cleanedContext = learningContext
+      .map((c) => ({
+        name: c.Bezeichnung,
+        group: c.Ensemble_Gruppe,
+        category: c.P_V_Art,
+      }))
+      .filter(
+        (item, index, self) =>
+          index ===
+          self.findIndex(
+            (t) =>
+              t.name === item.name &&
+              t.group === item.group &&
+              t.category === item.category
+          )
+      );
 
-You have these possible categories:
-${categories.map((c) => `- ${c}`).join("\n")}
+    const systemPrompt = `
+You are a classification assistant. You are given some text describing a musical event or rehearsal.
 
 Instructions:
 1. Determine the SINGLE best category from the list.
-2. Output ONLY valid JSON with the key "category". Example:
-{"category": "Sonstige Anlässe"}
-
-3. Do not include extra text or keys beyond {"category": "..."}.
-4. If the name contains "Probe" and nothing like "Register", "Registerprobe", "Registerprobe Hohes Blech" etc., pick "Gesamtorchester Vollprobe" => its the most common category.
-5. If unsure, pick the closest category.
+2. If the name contains "Probe" and nothing like "Register", "Registerprobe", "Registerprobe Hohes Blech" etc., pick "Gesamtorchester Vollprobe" => its the most common category.
+3. If unsure, pick the closest category.
+4. Provide a confidence score between 0 and 1.
 `;
 
-    const response = await openai.chat.completions.create({
-      model: "gpt-4",
-      messages: [{ role: "system", content: systemPrompt }],
+    const completion = await openai.beta.chat.completions.parse({
+      model: "gpt-4o-mini",
+      messages: [
+        { role: "system", content: systemPrompt },
+        {
+          role: "user",
+          content: `Text: "${text}"\n\nCategories:\n${categories
+            .map((c) => `- ${c}`)
+            .join("\n")}`,
+        },
+        {
+          role: "user",
+          content: `These are old that you should learn from:\n${cleanedContext
+            .map((c) => `- ${c.name} (${c.group}) - ${c.category}`)
+            .join("\n")}`,
+        },
+      ],
       temperature: 0,
+      response_format: zodResponseFormat(
+        ClassificationResponse,
+        "classification"
+      ),
     });
 
-    const raw = response.choices[0]?.message?.content?.trim() || "";
+    const result = completion.choices[0].message.parsed;
 
-    // Attempt to parse the returned JSON
-    let parsedCategory: string | null = null;
-    try {
-      const json = JSON.parse(raw);
-      if (typeof json.category === "string") {
-        parsedCategory = json.category.trim();
-      }
-    } catch (parseErr) {
-      console.warn("Could not parse structured JSON from OpenAI:", parseErr);
+    // Add null check for result
+    if (!result) {
+      console.warn(
+        "No classification result received, using fallback category"
+      );
+      return categories[0];
     }
 
     // Verify that we got a category that exists in our categories array
-    if (parsedCategory) {
-      // Make case-insensitive check to see if it matches
-      const match = categories.find(
-        (cat) => cat.toLowerCase() === parsedCategory!.toLowerCase()
-      );
-      if (match) {
-        return match;
-      }
+    const match = categories.find(
+      (cat) => cat.toLowerCase() === result.category.toLowerCase()
+    );
+
+    if (match) {
+      return match;
     }
 
     // Fallback to first if no valid match

@@ -22,13 +22,16 @@ dependencies:
     version: 4.21.2
   openai:
     specifier: ^4.82.0
-    version: 4.82.0
+    version: 4.82.0(zod@3.24.1)
   tsx:
     specifier: ^4.19.2
     version: 4.19.2
   uuid:
     specifier: ^11.0.5
     version: 11.0.5
+  zod:
+    specifier: ^3.24.1
+    version: 3.24.1
 
 devDependencies:
   '@types/express':
@@ -904,7 +907,7 @@ packages:
       ee-first: 1.1.1
     dev: false
 
-  /openai@4.82.0:
+  /openai@4.82.0(zod@3.24.1):
     resolution: {integrity: sha512-1bTxOVGZuVGsKKUWbh3BEwX1QxIXUftJv+9COhhGGVDTFwiaOd4gWsMynF2ewj1mg6by3/O+U8+EEHpWRdPaJg==}
     hasBin: true
     peerDependencies:
@@ -923,6 +926,7 @@ packages:
       form-data-encoder: 1.7.2
       formdata-node: 4.4.1
       node-fetch: 2.7.0
+      zod: 3.24.1
     transitivePeerDependencies:
       - encoding
     dev: false
@@ -1180,3 +1184,7 @@ packages:
     resolution: {integrity: sha512-Ux4ygGWsu2c7isFWe8Yu1YluJmqVhxqK2cLXNQA5AcC3QfbGNpM7fu0Y8b/z16pXLnFxZYvWhd3fhBY9DLmC6Q==}
     engines: {node: '>=6'}
     dev: true
+
+  /zod@3.24.1:
+    resolution: {integrity: sha512-muH7gBL9sI1nciMZV67X5fTKKBLtwpZ5VBp1vsOQzj1MhrBZ4wlVCm3gedKZWLp0Oyel8sIGfeiz54Su+OVT+A==}
+    dev: false

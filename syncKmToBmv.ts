@@ -3,7 +3,7 @@ import {
   GetAppointmentsPayload,
   Appointment,
 } from "./konzertmeister";
-import { BmvSync, NewProben } from "./bmvSync";
+import { BmvSync, NewProben, Proben } from "./bmvSync";
 import dayjs from "dayjs";
 import {
   identifyP_V_ArtFromOpenAI,
@@ -56,7 +56,8 @@ function splitDateTime(isoString?: string): { date?: string; time?: string } {
  * Converts a KM appointment to BMV "Proben" format, storing KM_ID in Anmerkung.
  */
 async function convertKmToBmvFormat(
-  appointment: Appointment
+  appointment: Appointment,
+  oldAppointments: Proben[]
 ): Promise<NewProben> {
   const isAuftritt = appointment.typId === 2;
   const isProbe = appointment.typId === 1;
@@ -98,7 +99,11 @@ async function convertKmToBmvFormat(
 
   // Get P_V_Art from OpenAI
   const categories = isProbe ? PROBE_CATEGORIES : EVENT_CATEGORIES;
-  const pVArt = await identifyP_V_ArtFromOpenAI(combinedText, categories);
+  const pVArt = await identifyP_V_ArtFromOpenAI(
+    combinedText,
+    categories,
+    oldAppointments
+  );
 
   return {
     // Full date/time is stored in V_DATUM; times in V_ZEIT_V/B
@@ -119,8 +124,6 @@ async function convertKmToBmvFormat(
 
     // Optional: location info
     V_ORT: appointment.location?.formattedAddress,
-    Bez_Veranstaltungslokal: appointment.meetingPoint || undefined,
-
     // If you have a default Probengruppe ID:
     Probengruppen_ID: "620C0A8B-FBAF-4E3F-B622-40501D54732C",
   };
@@ -204,15 +207,19 @@ export async function syncKmToBmvAvoidDuplicates() {
       `${appointmentsToProcess.length} new appointments (not in BMV) out of ${kmAppointments.length} total.`
     );
 
-    // Convert appointments in parallel using Promise.all
+    // Convert appointments in parallel using Promise.all, passing oldAppointments
     const bmvProben = await Promise.all(
-      appointmentsToProcess.map((apt) => convertKmToBmvFormat(apt))
+      appointmentsToProcess.map((apt) =>
+        convertKmToBmvFormat(apt, bmvActivities)
+      )
     );
 
     if (bmvProben.length === 0) {
       console.log("No new appointments to sync.");
       return;
     }
+
+    console.log("bmvProben", bmvProben);
 
     // 8) Post to BMV
     const success = await bmvSync.postActivities(bmvProben);
