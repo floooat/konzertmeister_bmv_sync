@@ -65,7 +65,8 @@ export async function identifyP_V_ArtFromOpenAI(
               t.group === item.group &&
               t.category === item.category
           )
-      );
+      )
+      .slice(-100);
 
     const systemPrompt = `
 You are a classification assistant. You are given some text describing a musical event or rehearsal.
