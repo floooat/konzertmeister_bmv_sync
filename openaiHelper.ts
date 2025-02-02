@@ -89,7 +89,7 @@ Instructions:
         },
         {
           role: "user",
-          content: `These are old that you should learn from:\n${cleanedContext
+          content: `These are old event / category pairs that you can use for learning:\n${cleanedContext
             .map((c) => `- ${c.name} (${c.group}) - ${c.category}`)
             .join("\n")}`,
         },
