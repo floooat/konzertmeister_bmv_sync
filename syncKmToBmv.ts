@@ -140,11 +140,11 @@ export async function syncKmToBmvAvoidDuplicates() {
       username: process.env.BMV_USERNAME!,
       password: process.env.BMV_PASSWORD!,
     });
-    const bmvOk = await bmvSync.checkUser();
-    if (!bmvOk) {
-      console.error("Failed BMV login check");
-      return;
-    }
+    // const bmvOk = await bmvSync.checkUser();
+    // if (!bmvOk) {
+    //   console.error("Failed BMV login check");
+    //   return;
+    // }
 
     // 1) Fetch existing BMV appointments from a wide date range
     const now = dayjs();
