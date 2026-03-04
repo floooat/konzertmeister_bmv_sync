@@ -202,4 +202,11 @@
 **/*.lnk
 
 # End of https://www.toptal.com/developers/gitignore/api/macos,windows,node
+
+# Test/scratch files
+_test_*.ts
+_check_*.ts
+_delete_*.ts
+BMV-api-demo
+
 fly.toml

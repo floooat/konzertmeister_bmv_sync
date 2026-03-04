@@ -1,19 +1,21 @@
-FROM node:18-alpine
+FROM node:22-alpine
 
 WORKDIR /app
 
+# Install pnpm
+RUN corepack enable && corepack prepare pnpm@latest --activate
+
 # Install dependencies first (better caching)
-COPY package*.json ./
-RUN npm install
+COPY package.json pnpm-lock.yaml ./
+RUN pnpm install --frozen-lockfile --prod=false
 
 # Copy source code
-COPY . .
+COPY *.ts ./
+COPY tsconfig.json ./
 
 # Build TypeScript
-RUN npm run build
+RUN pnpm run build
 
-# Expose port
 EXPOSE 3000
 
-# Start the server
-CMD ["node", "dist/server.js"] 
+CMD ["node", "dist/server.js"]

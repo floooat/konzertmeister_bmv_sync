@@ -33,18 +33,125 @@ export const EVENT_CATEGORIES = [
 const ClassificationResponse = z.object({
   category: z.string(),
   confidence: z.number(),
-  reasoning: z.string().optional(),
+  reasoning: z.string().nullable(),
 });
 
 /**
- * Classifier function that picks the best match from a set of possible categories
- * using the OpenAI ChatCompletion endpoint with structured output.
+ * Rule-based classifier for probe (rehearsal) categories.
+ */
+function classifyProbeByRules(text: string): string | null {
+  const t = text.toLowerCase();
+
+  // Sitzung / meetings
+  if (/sitzung|jahreshauptversammlung|vorstandswechsel|hauptversammlung/.test(t)) {
+    return "Sitzung";
+  }
+
+  // Register/section rehearsals → Gesamtorchester Teilprobe
+  if (/registerprobe|registerservice/.test(t)) {
+    return "Gesamtorchester Teilprobe";
+  }
+  // "Probe Holz", "Probe Blech", "Probe Schlagzeug" (but NOT "Probe bildSTARS")
+  if (/\bprobe\s+(holz|blech|schlagzeug|flöte|klarinette|saxophon|horn|posaune|tuba|tenorhorn|trompete|hohes blech|tiefes blech)\b/.test(t)) {
+    return "Gesamtorchester Teilprobe";
+  }
+
+  // Youth/ensemble subgroups
+  if (/bildstar|jugendmusik|jugendorchester/.test(t)) {
+    return "Ensembleprobe";
+  }
+
+  // Everything else: Vollprobe, Gesamtprobe, Generalprobe, Hauptprobe, Probenwochenende, Marschprobe, etc.
+  return "Gesamtorchester Vollprobe";
+}
+
+/**
+ * Rule-based classifier for event (Veranstaltung) categories.
+ */
+function classifyEventByRules(text: string): string | null {
+  const t = text.toLowerCase();
+
+  // Church events
+  if (/krönung|seelensonntag|fronleichnam|erstkommunion|christmette|firmung|gottesdienst|prozession|allerheiligen|kirchlich|messgestaltung/.test(t)) {
+    return "Kirchliche Feierlichkeiten";
+  }
+
+  // Competitions
+  if (/wettbewerb|wertung|marschwertung/.test(t)) {
+    return "Wettbewerbe/Wertungsspiele";
+  }
+
+  // Private occasions
+  if (/geburtstag|hochzeit|taufe|ständchen|trauzeugen/.test(t)) {
+    return "Private Anlässe";
+  }
+
+  // Funerals
+  if (/begräbnis|beerdigung|trauerfeier/.test(t)) {
+    return "Begräbnisse";
+  }
+
+  // Concerts (own)
+  if (/konzert(?!meister)/.test(t)) {
+    return "Vereinseigene Konzerte";
+  }
+
+  // Own festivals/events
+  if (/musikfest|unterhaltungsabend|christbaumfeier|musigball|\bball\b|tag der blasmusik|feuerwehrfest/.test(t)) {
+    return "Vereinseigene Musikfeste";
+  }
+
+  // Public occasions
+  if (/silvesterblasen|silvester|gemeindevertretung|gemeinde(?!.*verein)|bürgermeister/.test(t)) {
+    return "Öffentliche Anlässe (Gemeinde, Parteien)";
+  }
+
+  // Carnival / misc public
+  if (/funken|fasching|faschingsumzug/.test(t)) {
+    return "Sonstige Anlässe";
+  }
+
+  // Default for events — "Sonstige Anlässe" is safest
+  return "Sonstige Anlässe";
+}
+
+/**
+ * Rule-based fallback classifier. Returns a category from the given list,
+ * or null if no confident match (caller should use OpenAI).
+ */
+export function classifyByRules(
+  text: string,
+  categories: string[],
+  isProbe: boolean
+): string {
+  const result = isProbe
+    ? classifyProbeByRules(text)
+    : classifyEventByRules(text);
+
+  // Verify the result is in the allowed categories
+  if (result) {
+    const match = categories.find(
+      (cat) => cat.toLowerCase() === result.toLowerCase()
+    );
+    if (match) return match;
+  }
+
+  return categories[0];
+}
+
+/**
+ * Classifier function that picks the best match from a set of possible categories.
+ * Uses OpenAI for classification, with rule-based fallback if the API fails.
  */
 export async function identifyP_V_ArtFromOpenAI(
   text: string,
   categories: string[],
-  learningContext: Proben[]
+  learningContext: Proben[],
+  isProbe?: boolean
 ): Promise<string> {
+  // Detect probe vs event from categories if not explicitly passed
+  const probeMode = isProbe ?? categories.includes("Ensembleprobe");
+
   try {
     const openai = new OpenAI({
       apiKey: process.env.OPENAI_API_KEY,
@@ -69,13 +176,21 @@ export async function identifyP_V_ArtFromOpenAI(
       .slice(-100);
 
     const systemPrompt = `
-You are a classification assistant. You are given some text describing a musical event or rehearsal.
+You are a classification assistant for an Austrian brass band ("Blasmusik"). You are given text describing a musical event or rehearsal and must pick the SINGLE best category.
 
-Instructions:
-1. Determine the SINGLE best category from the list.
-2. If the name contains "Probe" and nothing like "Register", "Registerprobe", "Registerprobe Hohes Blech" etc., pick "Gesamtorchester Vollprobe" => its the most common category.
-3. If unsure, pick the closest category.
-4. Provide a confidence score between 0 and 1.
+Key rules:
+- "Vollprobe", "Gesamtprobe", "Generalprobe", "Hauptprobe", "Probenwochenende", "Marschprobe" → "Gesamtorchester Vollprobe"
+- "Registerprobe ..." or section rehearsals → "Gesamtorchester Teilprobe"
+- "Vorstandssitzung", "Sitzung", "Jahreshauptversammlung" → "Sitzung"
+- Youth ensembles like "bildSTARS" → "Ensembleprobe"
+- Church events: "Krönung", "Seelensonntag", "Fronleichnam", "Erstkommunion" → "Kirchliche Feierlichkeiten"
+- "Wettbewerb", "Wertungsspiel" → "Wettbewerbe/Wertungsspiele"
+- "Geburtstag", "Hochzeit" → "Private Anlässe"
+- "Konzert" → "Vereinseigene Konzerte"
+- "Musikfest", "Unterhaltungsabend", "Christbaumfeier" → "Vereinseigene Musikfeste"
+- "Funken", "Faschingsumzug" → "Sonstige Anlässe"
+- "Silvesterblasen" → "Öffentliche Anlässe (Gemeinde, Parteien)"
+- When unsure, pick the closest category.
 `;
 
     const completion = await openai.beta.chat.completions.parse({
@@ -104,15 +219,13 @@ Instructions:
 
     const result = completion.choices[0].message.parsed;
 
-    // Add null check for result
     if (!result) {
       console.warn(
-        "No classification result received, using fallback category"
+        "No classification result received, using rule-based fallback"
       );
-      return categories[0];
+      return classifyByRules(text, categories, probeMode);
     }
 
-    // Verify that we got a category that exists in our categories array
     const match = categories.find(
       (cat) => cat.toLowerCase() === result.category.toLowerCase()
     );
@@ -121,10 +234,9 @@ Instructions:
       return match;
     }
 
-    // Fallback to first if no valid match
-    return categories[0];
+    return classifyByRules(text, categories, probeMode);
   } catch (error) {
-    console.error("OpenAI error:", error);
-    return categories[0];
+    console.error("OpenAI error, using rule-based fallback:", (error as Error).message);
+    return classifyByRules(text, categories, probeMode);
   }
 }

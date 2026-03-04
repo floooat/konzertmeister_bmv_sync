@@ -3,7 +3,8 @@ import {
   GetAppointmentsPayload,
   Appointment,
 } from "./konzertmeister";
-import { BmvSync, NewProben, Proben } from "./bmvSync";
+import { NewProben, Proben } from "./bmvSync";
+import { BmvPortalSync } from "./bmvPortalSync";
 import dayjs from "dayjs";
 import {
   identifyP_V_ArtFromOpenAI,
@@ -12,9 +13,69 @@ import {
 } from "./openaiHelper";
 import "dotenv/config";
 
-// Add debug mode constant at the top
-const DEBUG_MODE = false;
-const DEBUG_LIMIT = 2;
+const DEBUG_MODE = process.env.DEBUG_MODE === "true";
+const DEBUG_LIMIT = Number(process.env.DEBUG_LIMIT ?? "2");
+
+function resolveSyncWindow(now: dayjs.Dayjs) {
+  const defaultStart = now.subtract(1, "year").startOf("year");
+  const defaultEnd = now.add(1, "year").endOf("year");
+
+  const start = process.env.KM_SYNC_START_DATE
+    ? dayjs(process.env.KM_SYNC_START_DATE)
+    : defaultStart;
+  const end = process.env.KM_SYNC_END_DATE
+    ? dayjs(process.env.KM_SYNC_END_DATE)
+    : defaultEnd;
+
+  if (!start.isValid()) {
+    throw new Error(`Invalid KM_SYNC_START_DATE: ${process.env.KM_SYNC_START_DATE}`);
+  }
+  if (!end.isValid()) {
+    throw new Error(`Invalid KM_SYNC_END_DATE: ${process.env.KM_SYNC_END_DATE}`);
+  }
+  if (end.isBefore(start)) {
+    throw new Error(
+      `Invalid sync window: end (${end.toISOString()}) is before start (${start.toISOString()})`
+    );
+  }
+
+  return { start, end };
+}
+
+async function fetchKmAppointmentsForWindow(
+  km: Konzertmeister,
+  windowStart: dayjs.Dayjs,
+  windowEnd: dayjs.Dayjs
+): Promise<Appointment[]> {
+  // KM /api/v3/app/getpaged/* rejects PAST/ALL for some accounts; FROM_DATE is known-good.
+  // We fetch from the start date and locally filter to the requested windowEnd.
+  const fromDatePayload: GetAppointmentsPayload = {
+    dateMode: "FROM_DATE",
+    filterStart: windowStart.toISOString(),
+    filterEnd: null,
+    parentOrgIds: null,
+    groupOrgIds: null,
+    settings: [],
+  };
+
+  try {
+    return await km.getAllAppointments(fromDatePayload);
+  } catch (error: any) {
+    console.warn(
+      `KM dateMode=FROM_DATE failed, falling back to UPCOMING: ${
+        error?.response?.data?.detail || error?.message || "unknown error"
+      }`
+    );
+    return km.getAllAppointments({
+      dateMode: "UPCOMING",
+      filterStart: null,
+      filterEnd: null,
+      parentOrgIds: null,
+      groupOrgIds: null,
+      settings: [],
+    });
+  }
+}
 
 /**
  * Parse "KM_ID=xxx" from BMV's Anmerkung (if present).
@@ -41,13 +102,13 @@ function getEnsembleFromRegister(name: string): string {
 /**
  * Split ISO string into separate date/time for BMV.
  */
-function splitDateTime(isoString?: string): { date?: string; time?: string } {
+function splitDateTime(isoString?: string): { date?: Date; time?: string } {
   if (!isoString) return {};
   const d = dayjs(isoString);
   if (!d.isValid()) return {};
 
   return {
-    date: d.toISOString(), // keep as full ISO date/time
+    date: d.toDate(), // Convert to Date object, not ISO string
     time: d.format("HH:mm"), // extract just HH:mm
   };
 }
@@ -57,7 +118,8 @@ function splitDateTime(isoString?: string): { date?: string; time?: string } {
  */
 async function convertKmToBmvFormat(
   appointment: Appointment,
-  oldAppointments: Proben[]
+  oldAppointments: Proben[],
+  vereinId: number
 ): Promise<NewProben> {
   const isAuftritt = appointment.typId === 2;
   const isProbe = appointment.typId === 1;
@@ -102,11 +164,13 @@ async function convertKmToBmvFormat(
   const pVArt = await identifyP_V_ArtFromOpenAI(
     combinedText,
     categories,
-    oldAppointments
+    oldAppointments,
+    isProbe
   );
 
-  return {
-    // Full date/time is stored in V_DATUM; times in V_ZEIT_V/B
+  // Create the activity object, filtering out undefined values
+  const activity: any = {
+    // Use proper Date object instead of ISO string
     V_DATUM: startDate,
     V_ZEIT_V: startTime,
     V_ZEIT_B: endTime,
@@ -116,17 +180,25 @@ async function convertKmToBmvFormat(
     P_V_Art: pVArt,
     Bezeichnung: appointment.name,
     AKM_PFL: akmPfl,
-    Anmerkung: anmerkungParts.join("\n") || undefined,
     AKM_Meldung: false,
     AKM_Meldedatum: null,
     Kopfquote: false,
-    verein_id: 236, // Your verein_id
+    verein_id: vereinId,
 
-    // Optional: location info
-    V_ORT: appointment.location?.formattedAddress,
-    // If you have a default Probengruppe ID:
+    // Use Probengruppe ID only if we have a valid one, otherwise let BMV assign
     Probengruppen_ID: "620C0A8B-FBAF-4E3F-B622-40501D54732C",
   };
+
+  // Only add optional fields if they have values
+  if (anmerkungParts.length > 0) {
+    activity.Anmerkung = anmerkungParts.join("\n");
+  }
+
+  if (appointment.location?.formattedAddress) {
+    activity.V_ORT = appointment.location.formattedAddress;
+  }
+
+  return activity;
 }
 
 /**
@@ -134,22 +206,33 @@ async function convertKmToBmvFormat(
  */
 export async function syncKmToBmvAvoidDuplicates() {
   try {
-    // Initialize BMV
-    const bmvSync = new BmvSync({
-      baseUrl: "https://api.vbv-blasmusik.at/api/",
-      username: process.env.BMV_USERNAME!,
-      password: process.env.BMV_PASSWORD!,
-    });
-    // const bmvOk = await bmvSync.checkUser();
-    // if (!bmvOk) {
-    //   console.error("Failed BMV login check");
-    //   return;
-    // }
+    // Initialize BMV via portal login
+    const bmvSync = new BmvPortalSync(
+      process.env.BMV_USERNAME!,
+      process.env.BMV_PASSWORD!,
+    );
+    const verification = await bmvSync.login();
+    if (!verification || !verification.isVerify) {
+      console.error(
+        "Failed BMV login check",
+        verification ? verification : "(no verification details)"
+      );
+      return;
+    }
+    const vereinId = verification.verein_id;
+    console.log(`BMV auth OK — verein_id: ${vereinId}`);
 
-    // 1) Fetch existing BMV appointments from a wide date range
     const now = dayjs();
-    const oneYearAgo = now.subtract(1, "year").toDate();
-    const bmvActivities = await bmvSync.getActivities(oneYearAgo);
+    const { start: syncStart, end: syncEnd } = resolveSyncWindow(now);
+    console.log(
+      `Sync window: ${syncStart.toISOString()} -> ${syncEnd.toISOString()}`
+    );
+
+    // Fetch existing BMV appointments across the full sync window.
+    const bmvActivities = await bmvSync.getActivitiesForWindow(
+      syncStart.toDate(),
+      syncEnd.toDate()
+    );
     if (!bmvActivities) {
       console.error("Could not fetch existing BMV activities");
       return;
@@ -179,18 +262,34 @@ export async function syncKmToBmvAvoidDuplicates() {
       return;
     }
 
-    // 5) Fetch all upcoming appointments from KM
-    const appointmentsPayload: GetAppointmentsPayload = {
-      dateMode: "UPCOMING",
-      filterStart: null,
-      filterEnd: null,
-      parentOrgIds: null,
-      groupOrgIds: null,
-      settings: [],
-    };
+    // Fetch appointments from KM for a bounded window (past + future coverage).
+    const rawKmAppointments = await fetchKmAppointmentsForWindow(
+      km,
+      syncStart,
+      syncEnd
+    );
+    const kmAppointments = rawKmAppointments
+      .filter((appointment) => {
+        if (!appointment.start) {
+          return true;
+        }
+        const startDate = dayjs(appointment.start);
+        if (!startDate.isValid()) {
+          return true;
+        }
+        return (
+          !startDate.isBefore(syncStart) && !startDate.isAfter(syncEnd)
+        );
+      })
+      .sort((a, b) => {
+        const aTs = dayjs(a.start).valueOf();
+        const bTs = dayjs(b.start).valueOf();
+        return aTs - bTs;
+      });
 
-    const kmAppointments = await km.getAllAppointments(appointmentsPayload);
-    console.log(`Fetched ${kmAppointments.length} appointments from KM`);
+    console.log(
+      `Fetched ${kmAppointments.length} appointments from KM within sync window.`
+    );
 
     // 6) Filter out duplicates (KM ID already in BMV)
     const newAppointments = kmAppointments.filter((apt) => {
@@ -198,7 +297,7 @@ export async function syncKmToBmvAvoidDuplicates() {
     });
 
     let appointmentsToProcess = newAppointments;
-    if (DEBUG_MODE) {
+    if (DEBUG_MODE && DEBUG_LIMIT > 0) {
       console.log("DEBUG MODE: Limiting to", DEBUG_LIMIT, "appointments");
       appointmentsToProcess = newAppointments.slice(0, DEBUG_LIMIT);
     }
@@ -210,7 +309,7 @@ export async function syncKmToBmvAvoidDuplicates() {
     // Convert appointments in parallel using Promise.all, passing oldAppointments
     const bmvProben = await Promise.all(
       appointmentsToProcess.map((apt) =>
-        convertKmToBmvFormat(apt, bmvActivities)
+        convertKmToBmvFormat(apt, bmvActivities, vereinId!)
       )
     );
 
@@ -219,14 +318,34 @@ export async function syncKmToBmvAvoidDuplicates() {
       return;
     }
 
-    console.log("bmvProben", bmvProben);
-
     // 8) Post to BMV
     const success = await bmvSync.postActivities(bmvProben);
     if (success) {
       console.log(
         `Successfully synced ${bmvProben.length} appointments to BMV.`
       );
+
+      // Verify that newly posted KM IDs are now visible from BMV readback.
+      const postedKmIds = new Set(appointmentsToProcess.map((apt) => apt.id));
+      const refreshedActivities = await bmvSync.getActivitiesForWindow(
+        syncStart.toDate(),
+        syncEnd.toDate()
+      );
+      const verifiedCount = refreshedActivities.reduce((count: number, activity: Proben) => {
+        const kmId = parseKonzertmeisterId(activity.Anmerkung);
+        if (kmId && postedKmIds.has(kmId)) {
+          return count + 1;
+        }
+        return count;
+      }, 0);
+      console.log(
+        `Post verification: ${verifiedCount}/${postedKmIds.size} KM_IDs are visible in BMV readback.`
+      );
+      if (verifiedCount < postedKmIds.size) {
+        console.warn(
+          `BMV post verification: ${verifiedCount}/${postedKmIds.size} KM_IDs visible (${postedKmIds.size - verifiedCount} may still be propagating).`
+        );
+      }
     } else {
       console.error("Failed to sync appointments to BMV.");
     }
@@ -235,5 +354,6 @@ export async function syncKmToBmvAvoidDuplicates() {
   }
 }
 
-// Run the sync
-syncKmToBmvAvoidDuplicates();
+if (require.main === module) {
+  syncKmToBmvAvoidDuplicates();
+}

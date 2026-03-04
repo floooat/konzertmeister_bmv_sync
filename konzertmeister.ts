@@ -23,7 +23,7 @@ export interface KonzertmeisterLoginRequest {
  * }
  */
 export interface GetAppointmentsPayload {
-  dateMode: "UPCOMING" | "PAST" | "ALL"; // or other possible values
+  dateMode: "UPCOMING" | "PAST" | "ALL" | "FROM_DATE"; // observed: PAST/ALL may be rejected by API
   filterStart: string | null;
   filterEnd: string | null;
   parentOrgIds: number[] | null;
@@ -331,9 +331,13 @@ export class Konzertmeister {
    */
   public async login(payload: KonzertmeisterLoginRequest): Promise<boolean> {
     try {
-      const response = await this.client.post("api/v2/login", payload, {
-        validateStatus: () => true, // We'll handle errors ourselves
-      });
+      const response = await this.client.post(
+        "api/v5/login/totpaware",
+        payload,
+        {
+          validateStatus: () => true, // We'll handle errors ourselves
+        }
+      );
 
       if (response.status !== 200) {
         console.error("Login failed:", response.data);
@@ -409,12 +413,28 @@ export class Konzertmeister {
 
     let allAppointments: Appointment[] = [];
     let page = 0;
+    const seenPageHeads = new Set<number>();
 
     while (true) {
       const batch = await this.getAppointments(page, payload);
+      if (process.env.KM_LOG_PAGES === "true") {
+        console.log(`KM page ${page}: ${batch.length} appointments`);
+      }
       if (batch.length === 0) {
         break; // no more data
       }
+
+      const firstId = batch[0]?.id;
+      if (typeof firstId === "number" && seenPageHeads.has(firstId)) {
+        console.warn(
+          `KM pagination appears to repeat at page ${page} (first appointment id ${firstId}). Stopping to avoid loop.`
+        );
+        break;
+      }
+      if (typeof firstId === "number") {
+        seenPageHeads.add(firstId);
+      }
+
       allAppointments.push(...batch);
       page++;
     }
